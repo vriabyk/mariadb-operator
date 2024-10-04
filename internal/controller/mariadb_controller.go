@@ -34,12 +34,14 @@ import (
 	"github.com/mariadb-operator/mariadb-operator/pkg/metadata"
 	"github.com/mariadb-operator/mariadb-operator/pkg/predicate"
 	"github.com/mariadb-operator/mariadb-operator/pkg/refresolver"
+	sts "github.com/mariadb-operator/mariadb-operator/pkg/statefulset"
 	"github.com/mariadb-operator/mariadb-operator/pkg/watch"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	klabels "k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -152,6 +154,10 @@ func (r *MariaDBReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		{
 			Name:      "StatefulSet",
 			Reconcile: r.reconcileStatefulSet,
+		},
+		{
+			Name:      "Labels",
+			Reconcile: r.reconcilePodLabels,
 		},
 		{
 			Name:      "PodDisruptionBudget",
@@ -337,6 +343,48 @@ func (r *MariaDBReconciler) reconcileStatefulSet(ctx context.Context, mariadb *m
 
 	if result, err := r.reconcileUpdates(ctx, mariadb); !result.IsZero() || err != nil {
 		return result, err
+	}
+	return ctrl.Result{}, nil
+}
+
+func (r *MariaDBReconciler) reconcilePodLabels(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB) (ctrl.Result, error) {
+	podList := corev1.PodList{}
+	listOpts := &client.ListOptions{
+		LabelSelector: klabels.SelectorFromSet(
+			labels.NewLabelsBuilder().
+				WithMariaDBSelectorLabels(mariadb).
+				Build(),
+		),
+		Namespace: mariadb.GetNamespace(),
+	}
+	if err := r.List(ctx, &podList, listOpts); err != nil {
+		return ctrl.Result{}, fmt.Errorf("error listing Pods: %v", err)
+	}
+
+	// Iterate over pods and assign the role labels
+	for _, pod := range podList.Items {
+		podIndex, err := sts.PodIndex(pod.Name)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("error getting Pod '%s' index: %v", pod.Name, err)
+		}
+
+		roleLabel := "replica" // Default to replica
+		if *podIndex == *mariadb.Status.CurrentPrimaryPodIndex {
+			roleLabel = "primary"
+		}
+
+		// Check if the label needs to be updated
+		if pod.Labels["k8s.mariadb.com/role"] != roleLabel {
+			// Update the pod with the correct role label
+			if pod.Labels == nil {
+				pod.Labels = map[string]string{}
+			}
+			pod.Labels["k8s.mariadb.com/role"] = roleLabel
+
+			if err := r.Update(ctx, &pod); err != nil {
+				return ctrl.Result{}, fmt.Errorf("error updating Pod '%s' label: %v", pod.Name, err)
+			}
+		}
 	}
 	return ctrl.Result{}, nil
 }
